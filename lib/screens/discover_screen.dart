@@ -1,11 +1,11 @@
+import 'package:drop_link/data/database.dart';
+import 'package:drop_link/data/database_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../core/theme.dart';
 import '../providers/connection_provider.dart';
 import '../services/discovery_service.dart';
-import '../services/api_service.dart';
-import '../data/repository.dart';
 import 'qr_scanner_screen.dart';
 
 class DiscoverScreen extends ConsumerStatefulWidget {

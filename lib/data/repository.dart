@@ -1,7 +1,9 @@
 import 'package:drift/drift.dart';
 import 'package:uuid/uuid.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+import 'dart:io';
 import 'database.dart';
-import 'database_helper.dart';
 
 class SyncResponse {
   final int latestSeq;
@@ -17,11 +19,29 @@ class SyncResponse {
   });
 
   factory SyncResponse.fromJson(Map<String, dynamic> json) {
+    final rawItems = json['items'] as List?;
+    final itemsList = <Map<String, dynamic>>[];
+    if (rawItems != null) {
+      for (final it in rawItems) {
+        if (it is Map) {
+          itemsList.add(Map<String, dynamic>.from(it));
+        }
+      }
+    }
+
+    final rawDeleted = json['deleted'] as List?;
+    final deletedList = <String>[];
+    if (rawDeleted != null) {
+      for (final d in rawDeleted) {
+        if (d != null) deletedList.add(d.toString());
+      }
+    }
+
     return SyncResponse(
       latestSeq: json['latest_seq'] as int? ?? 0,
       fullResync: json['full_resync'] as bool? ?? false,
-      items: (json['items'] as List?)?.cast<Map<String, dynamic>>() ?? [],
-      deleted: (json['deleted'] as List?)?.cast<String>() ?? [],
+      items: itemsList,
+      deleted: deletedList,
     );
   }
 }
@@ -39,7 +59,7 @@ class Repository {
     return (db.select(db.items)
           ..where((tbl) => tbl.deviceId.equals(deviceId))
           ..where((tbl) => tbl.syncState.isNotIn(['pendingDelete']))
-          ..orderBy([(tbl) => OrderingTerm.asc(tbl.createdAt ?? tbl.timeLabel)]))
+          ..orderBy([(tbl) => OrderingTerm.asc(tbl.createdAt)]))
         .watch();
   }
 
@@ -55,7 +75,7 @@ class Repository {
         seq: const Value.absent(),
         origin: const Value('phone'),
         type: Value(text.startsWith('http') ? 'link' : 'text'),
-        text: Value(text),
+        content: Value(text),
         createdAt: Value(now),
         timeLabel: Value(timeLabel),
         syncState: const Value('queued'),
@@ -75,6 +95,15 @@ class Repository {
     final timeLabel = _formatTime(now);
     final sizeLabel = _formatBytes(sizeBytes);
 
+    // 1. Copy file to app-owned persistent storage
+    final appDocs = await getApplicationDocumentsDirectory();
+    final outboxDir = Directory(p.join(appDocs.path, 'outbox'));
+    if (!await outboxDir.exists()) {
+      await outboxDir.create(recursive: true);
+    }
+    final persistentPath = p.join(outboxDir.path, '${itemId}_$fileName');
+    await File(pickedPath).copy(persistentPath);
+
     await db.transaction(() async {
       await db.into(db.items).insert(ItemsCompanion(
         id: Value(itemId),
@@ -87,6 +116,7 @@ class Repository {
         sizeLabel: Value(sizeLabel),
         createdAt: Value(now),
         timeLabel: Value(timeLabel),
+        localPath: Value(persistentPath),
         syncState: const Value('queued'),
       ));
 
@@ -104,8 +134,8 @@ class Repository {
 
     if (item.syncState == 'queued') {
       await db.transaction(() async {
-        await db.delete(db.items).where((tbl) => tbl.id.equals(itemId));
-        await db.delete(db.outbox).where((tbl) => tbl.itemId.equals(itemId));
+        await (db.delete(db.items)..where((tbl) => tbl.id.equals(itemId))).go();
+        await (db.delete(db.outbox)..where((tbl) => tbl.itemId.equals(itemId))).go();
       });
       return;
     }
@@ -114,7 +144,7 @@ class Repository {
       await (db.update(db.items)..where((tbl) => tbl.id.equals(itemId)))
           .write(ItemsCompanion(syncState: Value('pendingDelete')));
       await db.into(db.outbox).insert(OutboxCompanion(
-        itemId: itemId,
+        itemId: Value(itemId),
         kind: const Value('delete'),
         createdAt: Value(DateTime.now().toUtc()),
       ));
@@ -124,14 +154,14 @@ class Repository {
   Future<void> applySync(String deviceId, SyncResponse response) async {
     await db.transaction(() async {
       if (response.fullResync) {
-        final unsentItemIds = (db.select(db.items)
+        final unsentItemIds = await (db.select(db.items)
               ..where((tbl) => tbl.deviceId.equals(deviceId))
               ..where((tbl) => tbl.syncState.isIn(['queued', 'sending', 'failed'])))
             .map((item) => item.id)
             .get();
 
-        await db.delete(db.items).where((tbl) => tbl.deviceId.equals(deviceId));
-        await db.delete(db.outbox).where((tbl) => tbl.itemId.isNotIn(unsentItemIds));
+        await (db.delete(db.items)..where((tbl) => tbl.deviceId.equals(deviceId))).go();
+        await (db.delete(db.outbox)..where((tbl) => tbl.itemId.isNotIn(unsentItemIds))).go();
       }
 
       for (final itemJson in response.items) {
@@ -152,8 +182,16 @@ class Repository {
 
       for (final deletedId in response.deleted) {
         final item = await (db.select(db.items)..where((tbl) => tbl.id.equals(deletedId))).getSingleOrNull();
-        if (item != null && item.localPath != null) {
-          await db.delete(db.items).where((tbl) => tbl.id.equals(deletedId));
+        if (item != null) {
+          if (item.localPath != null) {
+            try {
+              final file = File(item.localPath!);
+              if (await file.exists()) {
+                await file.delete();
+              }
+            } catch (_) {}
+          }
+          await (db.delete(db.items)..where((tbl) => tbl.id.equals(deletedId))).go();
         }
       }
 
@@ -171,7 +209,7 @@ class Repository {
     await db.transaction(() async {
       await (db.update(db.items)..where((tbl) => tbl.id.equals(itemId)))
           .write(ItemsCompanion(syncState: const Value('synced'), errorMessage: const Value(null)));
-      await db.delete(db.outbox).where((tbl) => tbl.itemId.equals(itemId));
+      await (db.delete(db.outbox)..where((tbl) => tbl.itemId.equals(itemId))).go();
     });
   }
 
@@ -209,7 +247,9 @@ class Repository {
 
   Future<List<OutboxItem>> getPendingOutbox() async {
     return (db.select(db.outbox)
-          ..where((tbl) => tbl.nextAttemptAt.isSmallerOrEqualValue(DateTime.now().toUtc()).or(tbl.nextAttemptAt.isNull()))
+          ..where((tbl) =>
+              tbl.nextAttemptAt.isSmallerOrEqualValue(DateTime.now().toUtc()) |
+              tbl.nextAttemptAt.isNull())
           ..orderBy([(tbl) => OrderingTerm.asc(tbl.createdAt)]))
         .get();
   }
@@ -221,8 +261,8 @@ class Repository {
 
   Future<void> discardFailed(String itemId) async {
     await db.transaction(() async {
-      await db.delete(db.items).where((tbl) => tbl.id.equals(itemId));
-      await db.delete(db.outbox).where((tbl) => tbl.itemId.equals(itemId));
+      await (db.delete(db.items)..where((tbl) => tbl.id.equals(itemId))).go();
+      await (db.delete(db.outbox)..where((tbl) => tbl.itemId.equals(itemId))).go();
     });
   }
 
@@ -243,6 +283,11 @@ class Repository {
     return (db.select(db.devices)..where((tbl) => tbl.isActive.equals(true))).getSingleOrNull();
   }
 
+  Stream<Device?> watchActiveDevice() {
+    return (db.select(db.devices)..where((tbl) => tbl.isActive.equals(true)))
+        .watchSingleOrNull();
+  }
+
   Future<void> setActiveDevice(String deviceId) async {
     await db.transaction(() async {
       await (db.update(db.devices)..where((tbl) => tbl.isActive.equals(true)))
@@ -259,18 +304,24 @@ class Repository {
       createdAt = DateTime.tryParse(createdAtStr);
     }
 
+    final id = (json['id'] ?? '').toString();
+    final origin = (json['from'] ?? json['origin'] ?? 'laptop').toString();
+    final type = (json['type'] ?? 'text').toString();
+    final content = (json['text'] ?? json['content']) as String?;
+    final timeStr = json['time'] as String? ?? (createdAt != null ? _formatTime(createdAt) : _formatTime(DateTime.now().toUtc()));
+
     return ItemsCompanion(
-      id: Value(json['id'] as String),
+      id: Value(id),
       deviceId: Value(deviceId),
       seq: Value(json['seq'] as int?),
-      origin: Value(json['from'] as String? ?? 'laptop'),
-      type: Value(json['type'] as String? ?? 'text'),
-      text: Value(json['text'] as String?),
+      origin: Value(origin),
+      type: Value(type),
+      content: Value(content),
       name: Value(json['name'] as String?),
       sizeBytes: Value(json['size_bytes'] as int?),
-      sizeLabel: Value(json['size'] as String?),
+      sizeLabel: Value(json['size'] as String? ?? ''),
       createdAt: createdAt != null ? Value(createdAt) : const Value.absent(),
-      timeLabel: Value(json['time'] as String? ?? ''),
+      timeLabel: Value(timeStr),
       syncState: const Value('synced'),
     );
   }

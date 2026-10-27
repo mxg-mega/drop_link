@@ -100,7 +100,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                           ),
                           const SizedBox(width: 6),
                           Text(
-                            connection.isConnected ? 'Laptop' : 'Offline',
+                            connection.isConnected
+                                ? 'Connected'
+                                : (connection.pendingCount > 0
+                                    ? 'Syncing ${connection.pendingCount}'
+                                    : 'Offline'),
                             style: const TextStyle(
                               fontSize: 12,
                               fontWeight: FontWeight.w500,

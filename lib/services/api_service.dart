@@ -1,4 +1,8 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// Result of probing the laptop server.
@@ -34,6 +38,9 @@ class ApiService {
   void setBaseUrl(String ip, {String port = '8000', String? token}) {
     baseUrl = 'http://$ip:$port';
     _token = (token != null && token.isNotEmpty) ? token : null;
+    debugPrint(
+      '[ApiService] setBaseUrl: $baseUrl (hasToken=${_token != null})',
+    );
 
     _dio.options
       ..baseUrl = baseUrl
@@ -53,6 +60,7 @@ class ApiService {
 
   void setDeviceId(String deviceId) {
     _deviceId = deviceId;
+    debugPrint('[ApiService] setDeviceId: "$deviceId"');
     if (_deviceId != null) {
       _dio.options.headers['X-Device-Id'] = _deviceId;
     }
@@ -65,15 +73,48 @@ class ApiService {
   String fileUrl(String filename) =>
       '$baseUrl/download/${Uri.encodeComponent(filename)}';
 
+  /// Stable local identifier for a downloaded file, derived from its filename.
+  String storageIdFor(String filename) =>
+      base64Url.encode(utf8.encode(filename)).replaceAll('=', '');
+
+  /// Returns the local path if this storage ID was previously downloaded.
+  /// This works offline; null means the file is not present on this device.
+  Future<String?> getDownloadedFilePath(String storageId) async {
+    try {
+      final filename = utf8.decode(
+        base64Url.decode(base64Url.normalize(storageId)),
+      );
+      final path = await _downloadPath(storageId, filename);
+      return await File(path).exists() ? path : null;
+    } on FormatException {
+      return null;
+    }
+  }
+
+  Future<String> _downloadPath(String storageId, String filename) async {
+    final dir = await getApplicationSupportDirectory();
+    final downloadDir = Directory('${dir.path}/drop_link_downloads');
+    await downloadDir.create(recursive: true);
+    final safeName = filename.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    return '${downloadDir.path}/${storageId}_$safeName';
+  }
+
   // -------- Connection --------
 
   /// /ping is public, so when the server wants a token we prove ours with a
   /// protected route (/shared is cheap) before calling the laptop "connected".
   Future<ConnectionCheck> checkConnection() async {
+    debugPrint('[ApiService] checkConnection() sending GET $baseUrl/ping...');
     try {
       final res = await _dio.get('/ping');
       final data = res.data;
+      debugPrint(
+        '[ApiService] checkConnection() /ping returned status=${res.statusCode}, data=$data',
+      );
       if (data is! Map || data['ping'] != 'pong') {
+        debugPrint(
+          '[ApiService] checkConnection() invalid ping response: data=$data',
+        );
         return const ConnectionCheck(
           ok: false,
           error: 'That address is not a DropLink server.',
@@ -82,9 +123,18 @@ class ApiService {
 
       final authRequired = data['auth_required'] == true;
       if (authRequired) {
+        debugPrint(
+          '[ApiService] checkConnection() auth_required=true, testing protected /shared route...',
+        );
         try {
-          await _dio.get('/shared');
+          final sharedRes = await _dio.get('/shared');
+          debugPrint(
+            '[ApiService] checkConnection() /shared auth verification passed, status=${sharedRes.statusCode}',
+          );
         } on DioException catch (e) {
+          debugPrint(
+            '[ApiService] checkConnection() /shared auth verification failed: statusCode=${e.response?.statusCode}',
+          );
           if (e.response?.statusCode == 401) {
             return const ConnectionCheck(
               ok: false,
@@ -96,7 +146,7 @@ class ApiService {
           rethrow;
         }
       }
-      return ConnectionCheck(
+      final check = ConnectionCheck(
         ok: true,
         authRequired: authRequired,
         deviceId: data['device_id'] as String?,
@@ -104,7 +154,12 @@ class ApiService {
         latestSeq: data['latest_seq'] as int?,
         phoneCursorSeq: data['phone_cursor_seq'] as int?,
       );
-    } catch (_) {
+      debugPrint(
+        '[ApiService] checkConnection() succeeded: deviceId=${check.deviceId}, deviceName=${check.deviceName}, latestSeq=${check.latestSeq}, phoneCursorSeq=${check.phoneCursorSeq}',
+      );
+      return check;
+    } catch (e) {
+      debugPrint('[ApiService] checkConnection() failed with error: $e');
       return const ConnectionCheck(
         ok: false,
         error: 'Could not connect. Check IP and hotspot.',
@@ -114,24 +169,40 @@ class ApiService {
 
   /// Raw /ping payload: {ping, app, phone_online, auth_required}.
   Future<Map<String, dynamic>> ping() async {
+    debugPrint('[ApiService] ping() GET $baseUrl/ping');
     final res = await _dio.get('/ping');
+    debugPrint('[ApiService] ping() result: ${res.data}');
     return Map<String, dynamic>.from(res.data as Map);
   }
 
   // -------- Sync --------
 
   Future<Map<String, dynamic>> sync(int after) async {
-    final res = await _dio.get(
-      '/sync',
-      queryParameters: {'after': after.toString()},
+    debugPrint(
+      '[ApiService] sync(after=$after) GET $baseUrl/sync?after=$after (headers=${_dio.options.headers})',
     );
-    return Map<String, dynamic>.from(res.data as Map);
+    try {
+      final res = await _dio.get(
+        '/sync',
+        queryParameters: {'after': after.toString()},
+      );
+      debugPrint(
+        '[ApiService] sync(after=$after) response status=${res.statusCode}, data=${res.data}',
+      );
+      return Map<String, dynamic>.from(res.data as Map);
+    } catch (e) {
+      debugPrint('[ApiService] sync(after=$after) error: $e');
+      rethrow;
+    }
   }
 
   // -------- Files --------
   Future<List<dynamic>> getSharedFiles() async {
+    debugPrint('[ApiService] getSharedFiles() GET $baseUrl/shared');
     final res = await _dio.get('/shared');
-    return res.data['files'] ?? [];
+    final files = res.data['files'] ?? [];
+    debugPrint('[ApiService] getSharedFiles() returned ${files.length} files');
+    return files;
   }
 
   // -------- History --------
@@ -140,11 +211,16 @@ class ApiService {
   /// Merge them into your list by `id`. If that id was deleted on the laptop
   /// the server returns everything, so replace-by-id keeps you consistent.
   Future<List<dynamic>> getHistory({String? since}) async {
+    debugPrint('[ApiService] getHistory(since=$since) GET $baseUrl/history');
     final res = await _dio.get(
       '/history',
       queryParameters: since == null ? null : {'since': since},
     );
-    return res.data['history'] ?? [];
+    final history = res.data['history'] ?? [];
+    debugPrint(
+      '[ApiService] getHistory(since=$since) returned ${history.length} items',
+    );
+    return history;
   }
 
   Future<Map<String, dynamic>> sendText({
@@ -152,16 +228,27 @@ class ApiService {
     required String clientId,
     required String clientTime,
   }) async {
-    final res = await _dio.post(
-      '/text',
-      data: FormData.fromMap({
-        'text': text,
-        'origin': 'phone',
-        'client_id': clientId,
-        'client_time': clientTime,
-      }),
+    debugPrint(
+      '[ApiService] sendText() POST $baseUrl/text: clientId="$clientId", clientTime="$clientTime", text="$text"',
     );
-    return Map<String, dynamic>.from(res.data as Map);
+    try {
+      final res = await _dio.post(
+        '/text',
+        data: FormData.fromMap({
+          'text': text,
+          'origin': 'phone',
+          'client_id': clientId,
+          'client_time': clientTime,
+        }),
+      );
+      debugPrint(
+        '[ApiService] sendText() response status=${res.statusCode}, data=${res.data}',
+      );
+      return Map<String, dynamic>.from(res.data as Map);
+    } catch (e) {
+      debugPrint('[ApiService] sendText() error: $e');
+      rethrow;
+    }
   }
 
   Future<Map<String, dynamic>> uploadFile({
@@ -171,50 +258,92 @@ class ApiService {
     required Function(double) onProgress,
   }) async {
     final fileName = filePath.split(RegExp(r'[\\/]')).last;
-
-    final formData = FormData.fromMap({
-      'file': await MultipartFile.fromFile(filePath, filename: fileName),
-      'origin': 'phone',
-      'client_id': clientId,
-      'client_time': clientTime,
-    });
-
-    final res = await _dio.post(
-      '/upload',
-      data: formData,
-      onSendProgress: (sent, total) {
-        if (total > 0) onProgress(sent / total);
-      },
+    debugPrint(
+      '[ApiService] uploadFile() POST $baseUrl/upload: fileName="$fileName", path="$filePath", clientId="$clientId"',
     );
-    return Map<String, dynamic>.from(res.data as Map);
+
+    try {
+      final formData = FormData.fromMap({
+        'file': await MultipartFile.fromFile(filePath, filename: fileName),
+        'origin': 'phone',
+        'client_id': clientId,
+        'client_time': clientTime,
+      });
+
+      final res = await _dio.post(
+        '/upload',
+        data: formData,
+        onSendProgress: (sent, total) {
+          if (total > 0) {
+            final fraction = sent / total;
+            debugPrint(
+              '[ApiService] uploadFile() progress: sent=$sent / total=$total (${(fraction * 100).toStringAsFixed(1)}%)',
+            );
+            onProgress(fraction);
+          }
+        },
+      );
+      debugPrint(
+        '[ApiService] uploadFile() response status=${res.statusCode}, data=${res.data}',
+      );
+      return Map<String, dynamic>.from(res.data as Map);
+    } catch (e) {
+      debugPrint('[ApiService] uploadFile() error: $e');
+      rethrow;
+    }
   }
 
   Future<String> downloadFile(
     String filename, {
     required Function(double) onProgress,
   }) async {
-    final dir = await getTemporaryDirectory();
-    final safeName = filename.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
-    final savePath = '${dir.path}/$safeName';
+    debugPrint('[ApiService] downloadFile() GET $baseUrl/download/$filename');
+    final storageId = storageIdFor(filename);
+    final savePath = await _downloadPath(storageId, filename);
 
-    await _dio.download(
-      '/download/${Uri.encodeComponent(filename)}',
-      savePath,
-      onReceiveProgress: (received, total) {
-        if (total > 0) onProgress(received / total);
-      },
-    );
-    return savePath;
+    try {
+      await _dio.download(
+        '/download/${Uri.encodeComponent(filename)}',
+        savePath,
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            final fraction = received / total;
+            debugPrint(
+              '[ApiService] downloadFile() progress: $received / $total (${(fraction * 100).toStringAsFixed(1)}%)',
+            );
+            onProgress(fraction);
+          }
+        },
+      );
+      debugPrint(
+        '[ApiService] downloadFile() saved successfully to "$savePath"',
+      );
+      return savePath;
+    } catch (e) {
+      debugPrint('[ApiService] downloadFile() error: $e');
+      rethrow;
+    }
   }
 
   Future<void> deleteItem(String id) async {
+    debugPrint('[ApiService] deleteItem() DELETE $baseUrl/history/$id');
     try {
-      await _dio.delete('/history/${Uri.encodeComponent(id)}');
+      final res = await _dio.delete('/history/${Uri.encodeComponent(id)}');
+      debugPrint(
+        '[ApiService] deleteItem($id) response: ${res.statusCode} ${res.data}',
+      );
     } on DioException catch (e) {
+      debugPrint(
+        '[ApiService] deleteItem($id) DioException statusCode=${e.response?.statusCode}',
+      );
       if (e.response?.statusCode == 404) {
         // Treat 404 as success - item already deleted
+        debugPrint('[ApiService] deleteItem($id) got 404 (already deleted)');
         return;
       }
+      rethrow;
+    } catch (e) {
+      debugPrint('[ApiService] deleteItem($id) error: $e');
       rethrow;
     }
   }

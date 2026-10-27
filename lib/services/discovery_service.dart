@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:nsd/nsd.dart';
 import '../data/repository.dart';
-import '../data/database.dart';
 
 class DiscoveredDevice {
   final String deviceId;
@@ -31,7 +31,6 @@ class DiscoveredDevice {
 
 class DiscoveryService {
   final Repository repository;
-  final Dio _dio = Dio();
 
   DiscoveryService(this.repository);
 
@@ -39,6 +38,7 @@ class DiscoveryService {
     Duration timeout = const Duration(seconds: 6),
     String configuredPort = '8000',
   }) async* {
+    debugPrint('[DiscoveryService] discover() started with timeout=${timeout.inSeconds}s, configuredPort=$configuredPort');
     final knownDevices = <String>{};
     final controller = StreamController<DiscoveredDevice>();
 
@@ -51,8 +51,12 @@ class DiscoveryService {
       configuredPort,
     );
 
+    // Yield devices from controller as they are discovered
+    yield* controller.stream;
+
     // Merge streams
     await Future.wait([mdnsStream, scanStream]);
+    debugPrint('[DiscoveryService] discover() finished: total discovered=${knownDevices.length}');
 
     await controller.close();
   }
@@ -62,39 +66,36 @@ class DiscoveryService {
     StreamController<DiscoveredDevice> controller,
     Set<String> knownDevices,
   ) async {
+    debugPrint('[DiscoveryService.mDNS] Starting mDNS discovery for "_droplink._tcp"...');
     try {
-      final service = Service(
-        type: '_droplink._tcp',
-        port: 0,
-        name: '',
-      );
+      final discovery = await startDiscovery('_droplink._tcp');
+      try {
+        await Future<void>.delayed(timeout);
+        debugPrint('[DiscoveryService.mDNS] mDNS discovery returned ${discovery.services.length} services');
 
-      final discovery = Discovery.start(
-        service,
-        timeout: timeout,
-      );
-
-      await for (final result in discovery) {
-        if (result.status == DiscoveryStatus.found) {
-          final service = result.service;
-          final host = service.host?.host;
+        for (final service in discovery.services) {
+          final host = service.host;
           final port = service.port;
 
-          if (host != null && port != null) {
-            final key = '$host:$port';
-            if (knownDevices.contains(key)) continue;
-            knownDevices.add(key);
+          if (host == null || port == null) continue;
 
-            // Verify with /ping
-            final device = await _verifyDevice(host, port, 'mdns');
-            if (device != null) {
-              controller.add(device);
-            }
+          final key = '$host:$port';
+          if (knownDevices.contains(key)) continue;
+          knownDevices.add(key);
+
+          debugPrint('[DiscoveryService.mDNS] Verifying mDNS service at $host:$port...');
+          // Verify with /ping
+          final device = await _verifyDevice(host, port, 'mdns');
+          if (device != null) {
+            debugPrint('[DiscoveryService.mDNS] Discovered via mDNS: ${device.name} (${device.ip}:${device.port})');
+            controller.add(device);
           }
         }
+      } finally {
+        await stopDiscovery(discovery);
       }
     } catch (e) {
-      // mDNS may fail on some devices, continue with scan
+      debugPrint('[DiscoveryService.mDNS] mDNS discovery failed/unsupported: $e');
     }
   }
 
@@ -104,6 +105,7 @@ class DiscoveryService {
     Set<String> knownDevices,
     String configuredPort,
   ) async {
+    debugPrint('[DiscoveryService.Subnet] Enumerating network interfaces for IPv4 addresses...');
     try {
       final interfaces = await NetworkInterface.list(
         includeLinkLocal: false,
@@ -118,6 +120,7 @@ class DiscoveryService {
           }
         }
       }
+      debugPrint('[DiscoveryService.Subnet] Own IP addresses found: $ownAddresses');
 
       final port = int.tryParse(configuredPort) ?? 8000;
       final futures = <Future<void>>[];
@@ -130,6 +133,7 @@ class DiscoveryService {
           if (parts.length != 4) continue;
 
           final base = '${parts[0]}.${parts[1]}.${parts[2]}';
+          debugPrint('[DiscoveryService.Subnet] Scanning subnet $base.1-254 on port $port...');
 
           // Scan hosts 1-254 with concurrency
           for (int i = 1; i <= 254; i++) {
@@ -154,8 +158,9 @@ class DiscoveryService {
       if (futures.isNotEmpty) {
         await Future.wait(futures, eagerError: false);
       }
+      debugPrint('[DiscoveryService.Subnet] Subnet scan completed.');
     } catch (e) {
-      // Scan may fail, that's ok
+      debugPrint('[DiscoveryService.Subnet] Subnet scan error: $e');
     }
   }
 
@@ -170,6 +175,7 @@ class DiscoveryService {
       if (device != null) {
         final key = device.key;
         if (!knownDevices.contains(key)) {
+          debugPrint('[DiscoveryService.Subnet] Discovered via subnet scan: ${device.name} ($host:$port, deviceId=${device.deviceId})');
           knownDevices.add(key);
           controller.add(device);
         }
@@ -200,12 +206,17 @@ class DiscoveryService {
       final deviceName = data['device_name'] as String?;
       final authRequired = data['auth_required'] == true;
 
-      if (deviceId == null) return null;
+      if (deviceId == null) {
+        debugPrint('[DiscoveryService] _verifyDevice($host:$port): Valid DropLink ping response but device_id is null! data=$data');
+        return null;
+      }
 
       // Check if paired
       final device = await repository.getDevice(deviceId);
       final isPaired = device != null;
       final hasToken = device?.token != null;
+
+      debugPrint('[DiscoveryService] _verifyDevice($host:$port via $via): SUCCESS -> deviceId=$deviceId, name=$deviceName, authRequired=$authRequired, isPaired=$isPaired, hasToken=$hasToken');
 
       return DiscoveredDevice(
         deviceId: deviceId,

@@ -24,7 +24,7 @@ class Items extends Table {
   IntColumn get seq => integer().nullable()();
   TextColumn get origin => text()(); // 'phone' or 'laptop'
   TextColumn get type => text()(); // 'text', 'link', 'file'
-  TextColumn get text => text().nullable()();
+  TextColumn get content => text().nullable()();
   TextColumn get name => text().nullable()();
   IntColumn get sizeBytes => integer().nullable()();
   TextColumn get sizeLabel => text().nullable()();

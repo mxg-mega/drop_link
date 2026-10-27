@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -16,9 +14,10 @@ class ShelfTab extends ConsumerStatefulWidget {
   ConsumerState<ShelfTab> createState() => _ShelfTabState();
 }
 
-class _ShelfState extends ConsumerState<ShelfTab> {
+class _ShelfTabState extends ConsumerState<ShelfTab> {
   final _textController = TextEditingController();
   final _scrollController = ScrollController();
+  bool _hasInitiallyScrolled = false;
 
   @override
   void dispose() {
@@ -27,29 +26,75 @@ class _ShelfState extends ConsumerState<ShelfTab> {
     super.dispose();
   }
 
-  void _send() {
-    final text = _textController.text.trim();
-    if (text.isEmpty) return;
-
-    ref.read(itemsProvider.notifier).sendText(text);
-    _textController.clear();
-
-    // Scroll to bottom after a short delay
-    Future.delayed(const Duration(milliseconds: 100), () {
-      if (_scrollController.hasClients) {
+  void _scrollToBottom({bool animate = true}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      final maxScroll = _scrollController.position.maxScrollExtent;
+      if (animate) {
         _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
+          maxScroll,
           duration: const Duration(milliseconds: 300),
           curve: Curves.easeOut,
         );
+      } else {
+        _scrollController.jumpTo(maxScroll);
       }
     });
   }
 
+  void _send() {
+    final text = _textController.text.trim();
+    debugPrint('[ShelfTab] _send() invoked with text: "$text"');
+    if (text.isEmpty) {
+      debugPrint('[ShelfTab] _send() ignored because text is empty');
+      return;
+    }
+
+    debugPrint('[ShelfTab] Calling itemsProvider.notifier.sendText("$text")');
+    ref.read(itemsProvider.notifier).sendText(text);
+    _textController.clear();
+    setState(() {});
+    _scrollToBottom(animate: true);
+  }
+
   @override
   Widget build(BuildContext context) {
+    // Listen for new incoming or outgoing items to auto-scroll to the end
+    ref.listen<List<TransferItem>>(itemsProvider, (previous, next) {
+      final prevCount = previous?.length ?? 0;
+      if (next.length > prevCount) {
+        debugPrint(
+          '[ShelfTab] New items detected ($prevCount -> ${next.length}). Auto-scrolling to bottom.',
+        );
+        _scrollToBottom(animate: _hasInitiallyScrolled);
+        _hasInitiallyScrolled = true;
+      }
+    });
+
     final items = ref.watch(itemsProvider);
     final isConnected = ref.watch(connectionProvider).isConnected;
+
+    // Initial scroll to bottom when items are first loaded into the view
+    if (items.isNotEmpty && !_hasInitiallyScrolled) {
+      _hasInitiallyScrolled = true;
+      _scrollToBottom(animate: false);
+    }
+
+    debugPrint(
+      '[ShelfTab] build() called: isConnected=$isConnected, itemCount=${items.length}',
+    );
+    if (items.isEmpty) {
+      debugPrint(
+        '[ShelfTab] items list is empty: showing ${isConnected ? "Send something to your laptop" : "Connect to your laptop first"}',
+      );
+    } else {
+      for (int i = 0; i < items.length; i++) {
+        final it = items[i];
+        debugPrint(
+          '[ShelfTab]   [#$i] id=${it.id}, from=${it.from}, type=${it.type}, text="${it.text}", name="${it.name}", size="${it.size}", time="${it.time}", status=${it.status}',
+        );
+      }
+    }
 
     return Column(
       children: [
@@ -85,10 +130,11 @@ class _ShelfState extends ConsumerState<ShelfTab> {
                 )
               : RefreshIndicator.adaptive(
                   onRefresh: () async {
-                    // No-op for now, sync handles it
+                    debugPrint('[ShelfTab] Pull-to-refresh triggered');
                   },
                   child: ListView.builder(
                     controller: _scrollController,
+                    physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
                     itemCount: items.length,
                     itemBuilder: (context, index) {
@@ -117,17 +163,47 @@ class _ShelfState extends ConsumerState<ShelfTab> {
                 ),
                 child: IconButton(
                   onPressed: () async {
-                    final result = await FilePickerPlatform.instance.pickFiles();
+                    debugPrint(
+                      '[ShelfTab] Attach button pressed: opening file picker...',
+                    );
+                    final result = await FilePickerPlatform.instance
+                        .pickFiles();
 
-                    if (result.single.path != null) {
-                      final file = result.single;
-                      final path = file.path!;
-                      final name = file.name;
-                      final sizeBytes = await file.length() ?? 0;
+                    if (result == null || result.isEmpty) {
+                      debugPrint(
+                        '[ShelfTab] File picker canceled or no file selected',
+                      );
+                      return;
+                    }
 
-                      ref
-                          .read(itemsProvider.notifier)
-                          .sendFile(path, name, sizeBytes);
+                    final files = result;
+                    debugPrint('[ShelfTab] ${files.length} file(s) selected');
+                    final notifier = ref.read(itemsProvider.notifier);
+                    for (var index = 0; index < files.length; index++) {
+                      final file = files[index];
+                      final path = file.path;
+                      if (path == null || path.isEmpty) {
+                        debugPrint(
+                          '[ShelfTab] Skipping file without a local path: ${file.name}',
+                        );
+                        continue;
+                      }
+
+                      int sizeBytes = await file.length() ?? 0;
+
+                      debugPrint(
+                        '[ShelfTab] Sending file ${index + 1}/${files.length}: name=${file.name}, sizeBytes=${sizeBytes}, path=$path',
+                      );
+
+                      await notifier.sendFile(path, file.name, sizeBytes);
+                      _scrollToBottom(animate: true);
+
+                      // Pace queued files and wait for each send to finish before starting the next.
+                      if (index < files.length - 1) {
+                        await Future<void>.delayed(
+                          const Duration(milliseconds: 200),
+                        );
+                      }
                     }
                   },
                   icon: const Icon(LucideIcons.paperclip, size: 20),
@@ -140,6 +216,13 @@ class _ShelfState extends ConsumerState<ShelfTab> {
                 child: TextField(
                   controller: _textController,
                   style: const TextStyle(fontSize: 15),
+                  onChanged: (_) => setState(() {}),
+                  onTap: () {
+                    Future.delayed(
+                      const Duration(milliseconds: 300),
+                      () => _scrollToBottom(animate: true),
+                    );
+                  },
                   decoration: InputDecoration(
                     hintText: "Send text or a link to laptop",
                     hintStyle: TextStyle(color: AppColors.mute),
@@ -197,6 +280,11 @@ class _ItemCard extends StatelessWidget {
     final isMine = item.from == "phone";
     final accent = isMine ? AppColors.phone : AppColors.laptop;
     final soft = isMine ? AppColors.phoneSoft : AppColors.laptopSoft;
+    final statusText = _getStatusText(item.status);
+
+    debugPrint(
+      '[ShelfTab._ItemCard] Rendering card: id=${item.id}, from=${item.from}, isMine=$isMine, type=${item.type}, text="${item.text}", name="${item.name}", size="${item.size}", time="${item.time}", status=${item.status} (statusIcon="$statusText")',
+    );
 
     return Column(
       crossAxisAlignment: isMine
@@ -239,7 +327,7 @@ class _ItemCard extends StatelessWidget {
             border: Border(top: BorderSide(color: accent, width: 3)),
           ),
           child: item.type == ItemType.text || item.type == ItemType.link
-              ? Text(
+              ? SelectableText(
                   item.text ?? "",
                   style: TextStyle(
                     fontSize: 15,
